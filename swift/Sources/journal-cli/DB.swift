@@ -1,4 +1,8 @@
-// DB.swift — minimal SQLite wrapper over the system libsqlite3.
+// DB.swift — minimal read-only SQLite wrapper over the system libsqlite3.
+//
+// There is deliberately no exec(): nothing in this build can issue a write.
+// Connections open SQLITE_OPEN_READONLY and set PRAGMA query_only, so even a
+// stray INSERT/UPDATE inside query() is refused by SQLite itself.
 import Foundation
 import SQLite3
 
@@ -7,31 +11,18 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 final class DB {
     let handle: OpaquePointer
 
-    init(path: String, readOnly: Bool = false) {
+    init(path: String) {
         var h: OpaquePointer?
-        let flags = readOnly ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
-        guard sqlite3_open_v2(path, &h, flags, nil) == SQLITE_OK, let h = h else {
+        guard sqlite3_open_v2(path, &h, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let h = h else {
             die("cannot open database \(path)")
         }
         handle = h
+        guard sqlite3_exec(h, "PRAGMA query_only=1", nil, nil, nil) == SQLITE_OK else {
+            die("cannot set query_only on \(path)")
+        }
     }
 
     deinit { sqlite3_close(handle) }
-
-    @discardableResult
-    func exec(_ sql: String, _ params: [Any?] = []) -> Int {
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else {
-            die("sql error: \(String(cString: sqlite3_errmsg(handle))) in \(sql.prefix(120))")
-        }
-        defer { sqlite3_finalize(stmt) }
-        bind(stmt!, params)
-        let rc = sqlite3_step(stmt)
-        guard rc == SQLITE_DONE || rc == SQLITE_ROW else {
-            die("sql step error: \(String(cString: sqlite3_errmsg(handle)))")
-        }
-        return Int(sqlite3_changes(handle))
-    }
 
     func query(_ sql: String, _ params: [Any?] = []) -> [[String: Any]] {
         var stmt: OpaquePointer?

@@ -10,10 +10,9 @@ permissions:
 
 jobs:
   test:
-    name: Build + test (Swift) ${{ matrix.tz }}
+    name: Build + test ${{ matrix.tz }}
     runs-on: macos-15
-    # Runners default to UTC, where a date offset applied on write but not on
-    # read cancels out. Run every leg under a non-UTC zone too.
+    # Date filters and ISO offsets depend on the local zone; run a non-UTC leg too.
     strategy:
       fail-fast: false
       matrix:
@@ -38,31 +37,4 @@ jobs:
         env:
           JOURNAL_SEED: ${{ steps.fixture.outputs.db }}
           JOURNAL_CLI: ${{ github.workspace }}/swift/.build/release/journal-cli
-        run: tests/test_write.sh
-
-  test-reference:
-    name: Test (Python reference) ${{ matrix.tz }}
-    runs-on: macos-15
-    # Runners default to UTC, where a date offset applied on write but not on
-    # read cancels out. Run every leg under a non-UTC zone too.
-    strategy:
-      fail-fast: false
-      matrix:
-        tz: [UTC, America/Los_Angeles]
-    env:
-      TZ: ${{ matrix.tz }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Make fixture store
-        id: fixture
-        run: |
-          DB=$(tests/make-fixture.sh "$RUNNER_TEMP/fixture")
-          echo "db=$DB" >> "$GITHUB_OUTPUT"
-
-      - name: Run test suite
-        env:
-          JOURNAL_SEED: ${{ steps.fixture.outputs.db }}
-          JOURNAL_CLI: ${{ github.workspace }}/reference/journal-cli.py
-        run: tests/test_write.sh
+        run: tests/test_read.sh

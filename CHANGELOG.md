@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.0.0 (read-only fork)
+
+Forked from [omarshahine/apple-journal-cli](https://github.com/omarshahine/apple-journal-cli)
+1.4.0. Versions below are the upstream history.
+
+### Removed: every write path
+
+- Commands `write`, `edit`, `delete`, `restore`, `empty`, `repair-locations`,
+  `sync-journals`, `sandbox` and `render`. Calling one exits 1 with
+  `'<cmd>' was removed`.
+- The write helpers, backup and risk-acknowledgment code, Markdown-to-RTF
+  rendering, image resizing and Photos lookup.
+- `DB.exec()`. Connections open `SQLITE_OPEN_READONLY` with
+  `PRAGMA query_only=1`, and only ever against a temp snapshot.
+- `reference/` (Python implementation), `skills/dayone-import/`, the npm
+  package and the release workflow that published to npm and Homebrew.
+
+### Changed: export
+
+- `--format json` is now the default, and `journal.json` is an object
+  (`export`, `journals`, `entries`) instead of a bare array.
+- Attachments are copied to `DIR/attachments/` (`--attachments none` to
+  skip). Re-runs skip files already present with the same size.
+- Entries carry `date_iso`, `created`, `updated`, `entry_type`,
+  `date_source`, `journals[]` and a flat `places[]`.
+- Assets carry their full decoded `metadata` minus opaque archived blobs, so
+  contact, music, workout, motion and state-of-mind assets are no longer
+  reduced to a bare type. Workout routes decode to `route[]` points.
+- `--since`, `--until` and `--include-empty` work on `export`.
+- `export` refuses a target inside Journal's container.
+
+### Fixed
+
+- Markdown export printed coordinates as `Optional(47.6)`.
+- A `genericMap` whose `visitsData` is a single object, not a list, lost its place.
+
 ## 1.4.0
 
 ### Added — an entry can belong to more than one journal

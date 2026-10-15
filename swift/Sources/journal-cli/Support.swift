@@ -6,12 +6,6 @@ let CORE_DATA_EPOCH = 978307200.0 // Core Data reference date -> unix epoch
 var DB_PATH = ProcessInfo.processInfo.environment["JOURNAL_DB"]
     ?? (NSHomeDirectory() + "/Library/Group Containers/group.com.apple.moments/Library/moments.sqlite")
 
-var DEFAULT_DB: String {
-    NSHomeDirectory() + "/Library/Group Containers/group.com.apple.moments/Library/moments.sqlite"
-}
-
-var BACKUPS_DIR: String { NSHomeDirectory() + "/Backups/journal-cli" }
-
 func attachDir() -> String {
     (URL(fileURLWithPath: DB_PATH).deletingLastPathComponent()
         .appendingPathComponent("Attachments")).path
@@ -27,16 +21,7 @@ func die(_ msg: String, code: Int32 = 1) -> Never {
     exit(code)
 }
 
-func cdNow() -> Double { Date().timeIntervalSince1970 - CORE_DATA_EPOCH }
-func cd(_ d: Date) -> Double { d.timeIntervalSince1970 - CORE_DATA_EPOCH }
-
 func uid() -> String { UUID().uuidString.uppercased() }
-
-func uidBytes(_ u: String) -> Data {
-    guard let x = UUID(uuidString: u) else { die("bad uuid \(u)") }
-    var t = x.uuid
-    return withUnsafeBytes(of: &t) { Data($0) }
-}
 
 func uString(_ d: Data?) -> String? {
     guard let d = d, d.count == 16 else { return nil }
@@ -46,18 +31,16 @@ func uString(_ d: Data?) -> String? {
     return UUID(uuid: t).uuidString.uppercased()
 }
 
-func journalRunning() -> Bool {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-    p.arguments = ["-x", "Journal"]
-    p.standardOutput = Pipe(); p.standardError = Pipe()
-    try? p.run(); p.waitUntilExit()
-    return p.terminationStatus == 0
-}
-
 func fmtDate(_ cdTimestamp: Double) -> String {
     let f = DateFormatter()
     f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.timeZone = .current
+    return f.string(from: Date(timeIntervalSince1970: cdTimestamp + CORE_DATA_EPOCH))
+}
+
+/// ISO 8601 with the local UTC offset, e.g. 2026-08-21T00:43:01+02:00.
+func isoDate(_ cdTimestamp: Double) -> String {
+    let f = ISO8601DateFormatter()
     f.timeZone = .current
     return f.string(from: Date(timeIntervalSince1970: cdTimestamp + CORE_DATA_EPOCH))
 }

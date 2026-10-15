@@ -1,100 +1,52 @@
 ---
 name: journal-cli
-description: Read and write Apple Journal entries from the terminal via the journal-cli binary. Use when the user asks to read, search, export, summarize, create, edit, or delete Apple Journal entries, mentions "my journal", journaling, Journal.app, or wants journal content piped into other workflows. macOS only; requires Full Disk Access.
+description: Read, search and export Apple Journal entries from the terminal via the read-only journal-cli binary. Use when the user asks to read, search, export, summarize or analyze Apple Journal entries, mentions "my journal", journaling, Journal.app, or wants journal content (text, places, photos, attachments) piped into other workflows. Cannot create, edit or delete entries. macOS only; requires Full Disk Access.
 ---
 
-# journal-cli
+# journal-cli (read-only)
 
-`journal-cli` reads and writes Apple Journal.app entries directly from its
-data store. All read commands take `--json`. Exit code 0 = success, 1 = error
-or refusal, with the reason on stderr prefixed `journal-cli:`.
+`journal-cli` reads Apple Journal.app entries directly from its data store.
+This build is read-only: it has no command that writes to Journal, and every
+query runs against a temp snapshot of the store. All read commands take
+`--json`. Exit code 0 = success, 1 = error, with the reason on stderr
+prefixed `journal-cli:`.
 
 Run `journal-cli --help` for the full surface, `journal-cli doctor` to check
-access (exit 1 means Full Disk Access is missing — tell the user to grant it
+access (exit 1 means Full Disk Access is missing; tell the user to grant it
 to the terminal and relaunch).
 
-## Reading (always safe)
-
-Reads copy the store to a temp snapshot first — safe while Journal.app is
-open, no locks, no mutation.
+## Commands
 
 ```sh
 journal-cli list --limit 20 --json          # newest first
 journal-cli list --since 2025-01-01 --until 2025-12-31 --json
 journal-cli show <id> --json                # full entry + assets + file paths
 journal-cli search "query" --json           # substring over title+body
-journal-cli export --dir DIR [--format json]
 journal-cli stats                           # counts, words, year histogram
 journal-cli journals --json                 # journals with entry counts
 journal-cli deleted --json                  # Recently Deleted
+journal-cli export --dir DIR                # DIR/journal.json + DIR/attachments/
+journal-cli export --dir DIR --format md    # one Markdown file per entry
+journal-cli export --dir DIR --attachments none --since 2026-01-01
 ```
 
-`show --json` asset objects carry `type` (photo, video, livePhoto,
-multiPinMap, link, audio, drawing, …), `files[].path` (absolute, on disk),
-plus per-type extras: `places[]` with lat/lon/name for locations, `url` and
-`link_title` for links, `duration` and `transcript` for audio,
-`drawing_text` for drawings.
+`show --json` and each exported entry carry `assets[]` with `type` (photo,
+video, livePhoto, multiPinMap, link, audio, drawing, music, contact,
+workoutRoute, …), decoded `metadata`, and `files[].path` (absolute, on disk).
+Per-type extras: `places[]` for map pins, `place` for geotagged media, `url`
+and `link_title` for links, `duration` and `transcript` for audio,
+`drawing_text` for drawings, `route[]` for workouts. Exported entries also
+have `journals[]`, a flat `places[]`, and `files[].export_path` relative to
+the export directory.
 
-## Writing (guarded)
+## Notes
 
-Live writes need `--live`, refuse while Journal.app is running (quit it
-first: `osascript -e 'tell application "Journal" to quit'`), and auto-backup
-to `~/Backups/journal-cli/` before touching anything.
-
-```sh
-journal-cli write --live --title T --body B [--date YYYY-MM-DD] [--bookmark]
-journal-cli write --live --media a.heic b.mov          # photos auto-resize
-journal-cli write --live --live-photo IMG.heic IMG.mov # image+video pair
-journal-cli write --live --lat N --lon N --place P --city C
-journal-cli write --live --link URL --link-title T
-journal-cli write --live --journal "Name" ...          # Mac-local staging journal (repeat for several)
-journal-cli edit <id> --live [same flags; --add-media/--add-link/--remove-media ID/--clear-location/--journal N]
-journal-cli edit <id> --live --add-journal "Name"      # keep other memberships; --remove-journal drops one
-journal-cli sync-journals --journal "Name"             # audit and show native finalization steps
-journal-cli delete <id> --live                         # soft; syncs properly
-journal-cli restore <id> --live
-```
-
-The entry id is printed as `Created entry <id> ...` — parse it with
-`grep -oE 'entry [0-9]+'`.
-
-## Rehearse before touching the real store
-
-```sh
-DB=$(journal-cli sandbox --dir /tmp/rehearsal)   # disposable copy
-journal-cli --db "$DB" write --body "test"       # no --live needed
-journal-cli --db "$DB" list --limit 3 --json
-```
-
-`--db` (or `$JOURNAL_DB`) points any command at another store. Prefer this
-for anything experimental; replay with `--live` once it looks right.
-
-## Sharp edges — do not work around these
-
-- **First live write requires a risk acknowledgment.** If the CLI refuses with
-  the risk warning, show the warning to the user and ask them to confirm
-  (and to back up via Journal -> Settings -> Export Journal Entries first);
-  only pass `--accept-risk` after they explicitly agree. Never pass it
-  preemptively.
-- **Prefer `--dry-run` first** for any write you compose: it validates inputs
-  and prints the plan without touching the store.
-
-- **Never bypass a refusal by adding `--force` on your own.** Two guards
-  exist for data-safety reasons and overriding them needs the user's explicit
-  ok:
-  - `edit --body/--title` on app-authored entries (they carry a CRDT copy of
-    the text; a forced RTF edit can be reverted or duplicated by sync).
-  - `delete --hard` on synced entries (the CloudKit record is not tombstoned
-    and the entry resurrects on the next sync).
-- Soft delete (`delete` without `--hard`) is the correct deletion for synced
-  entries — it propagates.
-- If the user has a designated test journal, write there
-  (`--journal "<name>"`); check `journal-cli journals --json` first.
-- `--journal` writes a Mac-local staging relationship. It does not construct
-  Journal's per-entry iCloud merge data. To sync membership to other devices,
-  run `sync-journals --journal "<staging name>"` and follow its native workflow:
-  create a differently named final journal in Journal.app, select all entries
-  in the staging journal, move them to the final journal, and wait for staging
-  to reach 0. The command is read-only.
-- Dates print in the machine's local timezone; a stale or invalid `TZ` env
-  var in your shell will skew displayed times, not stored ones.
+- If the user asks to create, edit or delete an entry, say this build cannot
+  and point them to Journal.app or the upstream
+  `omarshahine/apple-journal-cli`. Do not edit the SQLite file by hand.
+- `export` refuses a `--dir` inside Journal's container. Pick a normal folder.
+- Attachments can be gigabytes. On APFS the copy is a clone and is fast, but
+  ask before exporting to another volume.
+- `--db PATH` (or `$JOURNAL_DB`) reads another store, such as a backup copy.
+- Dates print in the machine's local timezone; `date_iso` in JSON carries the
+  offset. A stale `TZ` env var in your shell skews displayed times.

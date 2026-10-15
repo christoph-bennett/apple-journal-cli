@@ -88,22 +88,127 @@ func cmdSearch(_ a: Args) {
     render(hits, json: a.has("--json"), limit: a.int("--limit"), full: a.has("--full"))
 }
 
-func cmdExport(_ a: Args) {
-    guard let dir = a.value("--dir") else { die("export needs --dir") }
-    let format = a.value("--format") ?? "md"
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let payload: [(Entry, [[String: Any]])] = withSnapshot { db in
-        fetch(db).map { ($0, assetsFor(db, $0.id)) }
+/// Canonical path via realpath(3) on the nearest existing ancestor, so a
+/// target that does not exist yet still compares correctly against the store
+/// (Foundation's symlink resolution maps /private/tmp inconsistently).
+private func canonical(_ path: String) -> String {
+    var head = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+    var tail: [String] = []
+    while !FileManager.default.fileExists(atPath: head), head != "/" {
+        tail.insert((head as NSString).lastPathComponent, at: 0)
+        head = (head as NSString).deletingLastPathComponent
     }
-    if format == "json" {
-        let arr = payload.map { (e, assets) -> [String: Any] in
-            var j = e.json; j["assets"] = assets; return j
+    var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+    let real = realpath(head, &buf) != nil ? String(cString: buf) : head
+    return tail.reduce(real) { ($0 as NSString).appendingPathComponent($1) }
+}
+
+/// Refuse an export target inside Journal's own container: the export writes
+/// files, and nothing this tool writes may land next to the live store.
+private func guardExportDir(_ dir: String) -> String {
+    let target = canonical(dir)
+    let store = canonical((DB_PATH as NSString).deletingLastPathComponent)
+    let container = canonical(NSHomeDirectory() + "/Library/Group Containers/group.com.apple.moments")
+    for forbidden in [store, container] where target == forbidden || target.hasPrefix(forbidden + "/") {
+        die("refusing to export into Journal's data directory (\(forbidden)). Pick another --dir.")
+    }
+    return target
+}
+
+/// Copy each referenced attachment to DIR/attachments/<relative path>, set
+/// `export_path` on every file record, and return (copied, skipped, missing).
+/// The originals are only ever read. A file already present with the same
+/// size is left alone, so re-running an export is cheap.
+private func copyAttachments(_ payload: inout [(Entry, [[String: Any]])], into dir: String)
+    -> (Int, Int, Int) {
+    let fm = FileManager.default
+    var copied = 0, skipped = 0, missing = 0
+    for pi in payload.indices {
+        for ai in payload[pi].1.indices {
+            var files = (payload[pi].1[ai]["files"] as? [[String: Any]]) ?? []
+            for fi in files.indices {
+                guard let src = files[fi]["path"] as? String,
+                      let rel = files[fi]["relative_path"] as? String,
+                      files[fi]["exists"] as? Bool == true else { missing += 1; continue }
+                let relOut = "attachments/" + (rel.hasPrefix("/") ? URL(fileURLWithPath: rel).lastPathComponent : rel)
+                let dst = dir + "/" + relOut
+                let want = files[fi]["bytes"] as? Int64
+                if let have = (try? fm.attributesOfItem(atPath: dst)[.size]) as? Int64, have == want {
+                    skipped += 1
+                } else {
+                    try? fm.removeItem(atPath: dst)
+                    try? fm.createDirectory(atPath: (dst as NSString).deletingLastPathComponent,
+                                            withIntermediateDirectories: true)
+                    do { try fm.copyItem(atPath: src, toPath: dst); copied += 1 }
+                    catch { die("could not copy \(src) -> \(dst): \(error.localizedDescription)") }
+                }
+                files[fi]["export_path"] = relOut
+            }
+            payload[pi].1[ai]["files"] = files
         }
+    }
+    return (copied, skipped, missing)
+}
+
+func cmdExport(_ a: Args) {
+    guard let rawDir = a.value("--dir") else { die("export needs --dir") }
+    let format = a.value("--format") ?? "json"
+    guard ["json", "md"].contains(format) else { die("--format must be json or md") }
+    let attachMode = a.value("--attachments") ?? "copy"
+    guard ["copy", "none"].contains(attachMode) else { die("--attachments must be copy or none") }
+    let dir = guardExportDir(rawDir)
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+    var (payload, journals, member): ([(Entry, [[String: Any]])], [JournalRow], [Int64: [Int64]])
+        = withSnapshot { db in
+            (fetch(db, since: a.value("--since").map(parseDate),
+                   until: a.value("--until").map(parseDate),
+                   includeEmpty: a.has("--include-empty"))
+                .map { ($0, assetsFor(db, $0.id)) },
+             journalRows(db), memberships(db))
+        }
+    var copyNote = ""
+    if attachMode == "copy" {
+        let (c, s, m) = copyAttachments(&payload, into: dir)
+        copyNote = "attachments: \(c) copied, \(s) already present, \(m) missing in store"
+    }
+
+    let names = Dictionary(uniqueKeysWithValues: journals.map { ($0.pk, $0.name) })
+    let defaultJournal = journals.first(where: { $0.isDefault })
+    func journalsOf(_ e: Entry) -> [[String: Any]] {
+        let pks = member[e.id] ?? defaultJournal.map { [$0.pk] } ?? []
+        return pks.map { ["id": $0, "name": names[$0] as Any] }
+    }
+    func placesOf(_ assets: [[String: Any]]) -> [[String: Any]] {
+        assets.flatMap { a -> [[String: Any]] in
+            var ps = (a["places"] as? [[String: Any]]) ?? []
+            if let p = a["place"] as? [String: Any] { ps.append(p) }
+            return ps.map { var p = $0; p["asset_type"] = a["type"]; return p }
+        }
+    }
+
+    if format == "json" {
+        let entries = payload.map { (e, assets) -> [String: Any] in
+            var j = e.json
+            j["journals"] = journalsOf(e)
+            j["places"] = placesOf(assets)
+            j["assets"] = assets
+            return j
+        }
+        let doc: [String: Any] = [
+            "export": ["format": "journal-cli-export", "version": 1,
+                       "tool": "journal-cli \(VERSION)",
+                       "exported_at": ISO8601DateFormatter().string(from: Date()),
+                       "store": DB_PATH, "attachments": attachMode,
+                       "entry_count": entries.count],
+            "journals": journals.map { ["id": $0.pk, "name": $0.name, "default": $0.isDefault] },
+            "entries": entries,
+        ]
         let p = dir + "/journal.json"
-        try! JSONSerialization.data(withJSONObject: arr,
-            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-            .write(to: URL(fileURLWithPath: p))
-        print("Wrote \(payload.count) entries to \(p)")
+        do { try jsonData(doc).write(to: URL(fileURLWithPath: p)) }
+        catch { die("could not write \(p): \(error.localizedDescription)") }
+        print("Wrote \(entries.count) entries to \(p)")
+        if !copyNote.isEmpty { print(copyNote) }
         return
     }
     for (e, assets) in payload {
@@ -112,18 +217,20 @@ func cmdExport(_ a: Args) {
             .replacingOccurrences(of: " ", with: "-")
         let stamp = String((e.date ?? "").prefix(10))
         let name = "\(stamp)-\(e.id)\(slug.isEmpty ? "" : "-" + slug).md"
-        var out = "---\ndate: \(e.date ?? "")\nid: \(e.id)\n"
-        if !e.title.isEmpty {
-            let t = try! JSONSerialization.data(withJSONObject: [e.title])
-            let ts = String(data: t, encoding: .utf8)!.dropFirst().dropLast()
-            out += "title: \(ts)\n"
+        func yamlString(_ s: String) -> String {
+            let t = try! JSONSerialization.data(withJSONObject: [s])
+            return String(String(data: t, encoding: .utf8)!.dropFirst().dropLast())
         }
+        var out = "---\ndate: \(e.date ?? "")\nid: \(e.id)\n"
+        if !e.title.isEmpty { out += "title: \(yamlString(e.title))\n" }
         if e.bookmarked { out += "bookmarked: true\n" }
-        let places = assets.flatMap { ($0["places"] as? [[String: Any]]) ?? [] }
+        let js = journalsOf(e).compactMap { $0["name"] as? String }
+        if !js.isEmpty { out += "journals: [\(js.map(yamlString).joined(separator: ", "))]\n" }
+        let places = placesOf(assets)
         if !places.isEmpty {
             out += "locations:\n"
             for p in places {
-                let nm = (p["name"] as? String).map { "\"\($0)\"" } ?? "null"
+                let nm = (p["name"] as? String).map(yamlString) ?? "null"
                 out += "  - name: \(nm)\n    lat: \(p["lat"] ?? "null")\n    lon: \(p["lon"] ?? "null")\n"
             }
         }
@@ -132,12 +239,15 @@ func cmdExport(_ a: Args) {
         if !files.isEmpty {
             out += "\n"
             for f in files {
-                out += "![\(f["name"] as? String ?? "file")](\(f["path"] as? String ?? ""))\n"
+                let target = (f["export_path"] as? String) ?? (f["path"] as? String ?? "")
+                out += "![\(f["name"] as? String ?? "file")](\(target))\n"
             }
         }
-        try? out.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8)
+        do { try out.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8) }
+        catch { die("could not write \(name): \(error.localizedDescription)") }
     }
     print("Wrote \(payload.count) entries to \(dir)")
+    if !copyNote.isEmpty { print(copyNote) }
 }
 
 func cmdStats(_ a: Args) {
@@ -226,7 +336,7 @@ func cmdDeleted(_ a: Args) {
         print("\(String(format: "%5d", e["id"] as? Int64 ?? 0))  entry \(d)  deleted \(dd)  \(head)")
     }
     print("\n\(out.count) entr\(out.count == 1 ? "y" : "ies") in Recently Deleted."
-          + "  restore <id> brings one back; they purge ~30 days after deletion.")
+          + "  Journal.app can restore them; they purge ~30 days after deletion.")
 }
 
 func cmdDoctor(_ a: Args) {
@@ -245,7 +355,7 @@ func cmdDoctor(_ a: Args) {
     var isDir: ObjCBool = false
     let att = FileManager.default.fileExists(atPath: attachDir(), isDirectory: &isDir) && isDir.boolValue
     print("attach   \(attachDir())  \(att ? "ok" : "missing")")
-    print("Journal  \(journalRunning() ? "RUNNING (quit before writing)" : "not running")")
+    print("mode     read-only (this build cannot write to the store)")
     if ok {
         let n = withSnapshot { fetch($0).count }
         print("\nRead \(n) entries. All good.")

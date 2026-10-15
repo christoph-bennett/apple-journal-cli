@@ -5,38 +5,55 @@ struct Entry {
     var id: Int64
     var uuid: String?
     var date: String?
+    var dateISO: String?
+    var created: String?
+    var updated: String?
     var title: String
     var text: String
     var chars: Int64
     var bookmarked: Bool
     var draft: Bool
     var synced: Bool
+    var entryType: String?
+    var dateSource: String?
 
     var json: [String: Any] {
-        ["id": id, "uuid": uuid as Any, "date": date as Any, "title": title, "text": text,
-         "chars": chars, "bookmarked": bookmarked, "draft": draft, "synced": synced]
+        ["id": id, "uuid": uuid as Any, "date": date as Any, "date_iso": dateISO as Any,
+         "created": created as Any, "updated": updated as Any,
+         "title": title, "text": text, "chars": chars, "bookmarked": bookmarked,
+         "draft": draft, "synced": synced,
+         "entry_type": entryType as Any, "date_source": dateSource as Any]
     }
 }
 
-private func entryFrom(_ r: [String: Any]) -> Entry? {
-    guard let dt = r.d("ZENTRYDATE") else { return nil }
-    return Entry(id: r.i("Z_PK") ?? 0, uuid: uString(r.b("ZID")), date: fmtDate(dt),
+private let ENTRY_COLUMNS = """
+    Z_PK, ZID, ZENTRYDATE, ZCREATEDDATE, ZUPDATEDDATE, ZTEXTLENGTH, ZFLAGGED, ZISDRAFT,
+    ZISUPLOADEDTOCLOUD, ZENTRYTYPE, ZDATESOURCE, ZTITLE, ZTEXT
+    """
+
+private func entryFrom(_ r: [String: Any]) -> Entry {
+    let dt = r.d("ZENTRYDATE")
+    return Entry(id: r.i("Z_PK") ?? 0, uuid: uString(r.b("ZID")),
+                 date: dt.map(fmtDate), dateISO: dt.map(isoDate),
+                 created: r.d("ZCREATEDDATE").map(isoDate),
+                 updated: r.d("ZUPDATEDDATE").map(isoDate),
                  title: rtfToText(r.b("ZTITLE")), text: rtfToText(r.b("ZTEXT")),
                  chars: r.i("ZTEXTLENGTH") ?? 0, bookmarked: r.flag("ZFLAGGED"),
-                 draft: r.flag("ZISDRAFT"), synced: r.flag("ZISUPLOADEDTOCLOUD"))
+                 draft: r.flag("ZISDRAFT"), synced: r.flag("ZISUPLOADEDTOCLOUD"),
+                 entryType: r.s("ZENTRYTYPE"), dateSource: r.s("ZDATESOURCE"))
 }
 
 func fetch(_ db: DB, since: Date? = nil, until: Date? = nil, includeEmpty: Bool = false) -> [Entry] {
     let rows = db.query("""
-        select Z_PK, ZID, ZENTRYDATE, ZTEXTLENGTH, ZFLAGGED, ZISDRAFT,
-               ZISUPLOADEDTOCLOUD, ZTITLE, ZTEXT
+        select \(ENTRY_COLUMNS)
         from ZJOURNALENTRYMO
         where coalesce(ZISFULLYREMOVED,0)=0 and coalesce(ZRECENTLYDELETED,0)=0
         order by ZENTRYDATE desc
         """)
     var out: [Entry] = []
     for r in rows {
-        guard let e = entryFrom(r), let ts = r.d("ZENTRYDATE") else { continue }
+        guard let ts = r.d("ZENTRYDATE") else { continue }
+        let e = entryFrom(r)
         let d = Date(timeIntervalSince1970: ts + CORE_DATA_EPOCH)
         if let s = since, d < s { continue }
         if let u = until, d > u { continue }
@@ -47,41 +64,61 @@ func fetch(_ db: DB, since: Date? = nil, until: Date? = nil, includeEmpty: Bool 
 }
 
 func fetchOne(_ db: DB, _ pk: Int64) -> Entry? {
-    guard let r = db.one("""
-        select Z_PK, ZID, ZENTRYDATE, ZTEXTLENGTH, ZFLAGGED, ZISDRAFT,
-               ZISUPLOADEDTOCLOUD, ZTITLE, ZTEXT
-        from ZJOURNALENTRYMO where Z_PK=?
-        """, [pk]) else { return nil }
-    if r.d("ZENTRYDATE") == nil {
-        // still return it, with a nil date
-        return Entry(id: r.i("Z_PK") ?? 0, uuid: uString(r.b("ZID")), date: nil,
-                     title: rtfToText(r.b("ZTITLE")), text: rtfToText(r.b("ZTEXT")),
-                     chars: r.i("ZTEXTLENGTH") ?? 0, bookmarked: r.flag("ZFLAGGED"),
-                     draft: r.flag("ZISDRAFT"), synced: r.flag("ZISUPLOADEDTOCLOUD"))
-    }
-    return entryFrom(r)
+    guard let r = db.one("select \(ENTRY_COLUMNS) from ZJOURNALENTRYMO where Z_PK=?", [pk])
+    else { return nil }
+    return entryFrom(r) // date stays nil when the row has none
 }
 
 // ---------------------------------------------------------------- assets
 
+/// Metadata keys holding opaque archived blobs (MapKit items, map styling,
+/// camera state, LPLinkMetadata, CLLocation routes). Their useful content is
+/// decoded into named fields below; the base64 itself is only noise in an export.
+private let OPAQUE_META_KEYS: Set<String> = ["mapItemData", "styleData", "mapCameraData", "data",
+                                             "routeData"]
+
+private func scrubMeta(_ v: Any) -> Any {
+    if let d = v as? [String: Any] {
+        var out: [String: Any] = [:]
+        for (k, x) in d where !OPAQUE_META_KEYS.contains(k) { out[k] = scrubMeta(x) }
+        return out
+    }
+    if let a = v as? [Any] { return a.map(scrubMeta) }
+    return v
+}
+
+private func placeFrom(_ v: [String: Any]) -> [String: Any] {
+    // Copy only keys that are present: wrapping a missing value `as Any` stores
+    // an Optional, which then prints as "Optional(47.6)" in Markdown output.
+    var p: [String: Any] = [:]
+    if let n = v["placeName"] { p["name"] = n }
+    if let lat = v["latitude"] { p["lat"] = lat }
+    if let lon = v["longitude"] { p["lon"] = lon }
+    if let c = v["city"] { p["city"] = c }
+    if let t = v["typeOfPlace"] { p["type"] = t }
+    return p
+}
+
 func assetsFor(_ db: DB, _ pk: Int64) -> [[String: Any]] {
     var out: [[String: Any]] = []
     for r in db.query("""
-        select Z_PK, ZID, ZASSETTYPE, ZSOURCE, ZASSETMETADATA
+        select Z_PK, ZID, ZASSETTYPE, ZSOURCE, ZCREATEDDATE, ZISHIDDEN, ZASSETMETADATA
         from ZJOURNALENTRYASSETMO where ZENTRY=? order by Z_PK
         """, [pk]) {
         let m = resolveMeta(r.b("ZASSETMETADATA")) ?? [:]
         let type = r.s("ZASSETTYPE") ?? "?"
         var a: [String: Any] = ["id": r.i("Z_PK") ?? 0, "uuid": uString(r.b("ZID")) as Any,
-                                "type": type, "source": r.s("ZSOURCE") as Any]
+                                "type": type, "source": r.s("ZSOURCE") as Any,
+                                "created": r.d("ZCREATEDDATE").map(isoDate) as Any,
+                                "hidden": r.flag("ZISHIDDEN"),
+                                "metadata": scrubMeta(m)]
         switch type {
         case "multiPinMap", "genericMap":
-            var places: [[String: Any]] = []
-            for v in (m["visitsData"] as? [[String: Any]]) ?? [] where v["latitude"] != nil {
-                places.append(["name": v["placeName"] as Any, "city": v["city"] as Any,
-                               "lat": v["latitude"] as Any, "lon": v["longitude"] as Any])
-            }
-            a["places"] = places
+            // visitsData is normally a list of visits; one genericMap in the
+            // wild carries a single visit dict instead.
+            var visits = (m["visitsData"] as? [[String: Any]]) ?? []
+            if let one = m["visitsData"] as? [String: Any] { visits = [one] }
+            a["places"] = visits.filter { $0["latitude"] != nil }.map(placeFrom)
         case "audio":
             if let d = m["duration"] { a["duration"] = d }
             let segs = (m["transcriptSegments"] as? [[String: Any]]) ?? []
@@ -92,20 +129,14 @@ func assetsFor(_ db: DB, _ pk: Int64) -> [[String: Any]] {
                 .trimmingCharacters(in: .whitespacesAndNewlines), !ic.isEmpty {
                 a["drawing_text"] = ic
             }
+        case "workoutRoute":
+            if let route = decodeRoute(m) { a["route"] = route }
         case "link":
             let (url, title) = decodeLinkPayload(m)
             if let url = url { a["url"] = url }
             if let title = title { a["link_title"] = title }
         default:
-            if m["latitude"] != nil {
-                a["place"] = ["name": m["placeName"] as Any,
-                              "lat": m["latitude"] as Any, "lon": m["longitude"] as Any]
-            }
-        }
-        // photo/video may also carry a place
-        if a["place"] == nil, ["photo", "video", "livePhoto"].contains(type), m["latitude"] != nil {
-            a["place"] = ["name": m["placeName"] as Any,
-                          "lat": m["latitude"] as Any, "lon": m["longitude"] as Any]
+            if m["latitude"] != nil { a["place"] = placeFrom(m) }
         }
         var files: [[String: Any]] = []
         for f in db.query("""
@@ -114,11 +145,22 @@ func assetsFor(_ db: DB, _ pk: Int64) -> [[String: Any]] {
             """, [r.i("Z_PK") ?? 0]) {
             guard let p = f.s("ZFILEPATH"), !p.isEmpty else { continue }
             let full = p.hasPrefix("/") ? p : attachDir() + "/" + p
-            files.append(["path": full, "name": f.s("ZNAME") as Any,
-                          "exists": FileManager.default.fileExists(atPath: full)])
+            let size = (try? FileManager.default.attributesOfItem(atPath: full)[.size]) as? Int64
+            files.append(["path": full, "relative_path": p, "name": f.s("ZNAME") as Any,
+                          "exists": size != nil, "bytes": size as Any])
         }
         a["files"] = files
         out.append(a)
+    }
+    return out
+}
+
+/// Entry pk -> journal pks, from Journal's many-to-many membership table.
+/// Entries with no row belong to the default journal only.
+func memberships(_ db: DB) -> [Int64: [Int64]] {
+    var out: [Int64: [Int64]] = [:]
+    for r in db.query("select Z_5ENTRIES as e, Z_6JOURNALS as j from Z_5JOURNALS order by 2") {
+        out[r.i("e") ?? 0, default: []].append(r.i("j") ?? 0)
     }
     return out
 }
@@ -210,134 +252,4 @@ func journalRows(_ db: DB) -> [JournalRow] {
         out.append(JournalRow(pk: r.i("Z_PK") ?? 0, name: name, isDefault: isDefault))
     }
     return out
-}
-
-func resolveJournal(_ db: DB, _ sel: String) -> JournalRow {
-    let rows = journalRows(db)
-    if let pk = Int64(sel) {
-        if let j = rows.first(where: { $0.pk == pk }) { return j }
-        die("no journal with id \(sel)")
-    }
-    let hits = rows.filter { $0.name.lowercased() == sel.lowercased() }
-    if hits.count == 1 { return hits[0] }
-    if hits.isEmpty {
-        die("no journal named '\(sel)'. Have: "
-            + rows.map { "\($0.name) (\($0.pk))" }.joined(separator: ", "))
-    }
-    die("journal name '\(sel)' is ambiguous; use the id: "
-        + hits.map { String($0.pk) }.joined(separator: ", "))
-}
-
-// ---------------------------------------------------------------- write helpers
-
-func nextPK(_ db: DB, _ entityName: String) -> (ent: Int64, pk: Int64) {
-    guard let row = db.one("select Z_ENT, Z_MAX from Z_PRIMARYKEY where Z_NAME=?", [entityName])
-    else { die("entity \(entityName) missing from Z_PRIMARYKEY") }
-    let pk = (row.i("Z_MAX") ?? 0) + 1
-    db.exec("update Z_PRIMARYKEY set Z_MAX=? where Z_NAME=?", [pk, entityName])
-    return (row.i("Z_ENT") ?? 0, pk)
-}
-
-@discardableResult
-func addAsset(_ db: DB, entryPK: Int64, entryUUID: String, type: String, source: String,
-              metadata: [String: Any]?, slim: Int = 0) -> (pk: Int64, uuid: String) {
-    let (ent, pk) = nextPK(db, "JournalEntryAssetMO")
-    let au = uid()
-    db.exec("""
-        insert into ZJOURNALENTRYASSETMO
-          (Z_PK, Z_ENT, Z_OPT, ZENTRY, ZID, ZPARENTID, ZASSETTYPE, ZSOURCE,
-           ZCREATEDDATE, ZASSETMETADATA, ZISSLIM, ZISHIDDEN, ZISBEINGEDITED,
-           ZISUNDOABLYDELETED, ZISUPLOADEDTOCLOUD, ZISREMOVEDFROMCLOUD,
-           ZREFRESHASSETMETADATA, ZMINIMUMSUPPORTEDAPPVERSION)
-        values (?,?,1,?,?,?,?,?,?,?,?,0,0,0,0,0,0,0)
-        """, [pk, ent, entryPK, uidBytes(au), uidBytes(entryUUID), type, source,
-              cdNow(), metadata.map(metaBlob), slim])
-    return (pk, au)
-}
-
-@discardableResult
-func addFile(_ db: DB, assetPK: Int64, assetUUID: String, entryUUID: String,
-             srcPath: String, index: Int, resize: Bool = true, plainName: Bool = false) -> Int64 {
-    let e = ext(srcPath)
-    let name: String
-    if VIDEO_EXT.contains(e) { name = "video" }
-    else if PHOTO_EXT.contains(e) { name = "image" }
-    else { die("unsupported media type '.\(e)' (\(srcPath))") }
-    let relDir = entryUUID + "/" + assetUUID
-    let absDir = attachDir() + "/" + relDir
-    try? FileManager.default.createDirectory(atPath: absDir, withIntermediateDirectories: true)
-    let fname = plainName ? "\(uid()).\(e)" : "\(uid())_resized.\(e)"
-    let dst = absDir + "/" + fname
-    if name == "image" && resize { resizeInto(srcPath, dst) }
-    else { try? FileManager.default.copyItem(atPath: srcPath, toPath: dst) }
-    let (entID, pk) = nextPK(db, "JournalEntryAssetFileAttachmentMO")
-    db.exec("""
-        insert into ZJOURNALENTRYASSETFILEATTACHMENTMO
-          (Z_PK, Z_ENT, Z_OPT, ZASSET, ZID, ZPARENTID, ZFILEPATH, ZNAME, ZINDEX,
-           ZISUPLOADEDTOCLOUD, ZISREMOVEDFROMCLOUD)
-        values (?,?,1,?,?,?,?,?,?,0,0)
-        """, [pk, entID, assetPK, uidBytes(uid()), uidBytes(assetUUID),
-              relDir + "/" + fname, name, index])
-    return pk
-}
-
-// ---------------------------------------------------------------- asset ordering
-
-func orderingAppend(_ db: DB, _ pk: Int64, _ newUUIDs: [String]) {
-    var cur: [Any] = []
-    if let row = db.one("select ZASSETORDERING from ZJOURNALENTRYMO where Z_PK=?", [pk]),
-       let b = row.b("ZASSETORDERING"),
-       let j = (try? JSONSerialization.jsonObject(with: b)) as? [Any] { cur = j }
-    var next = -1
-    var i = 1
-    while i < cur.count { if let n = cur[i] as? Int, n > next { next = n }; i += 2 }
-    next += 1
-    for u in newUUIDs { cur.append(u); cur.append(next); next += 1 }
-    db.exec("update ZJOURNALENTRYMO set ZASSETORDERING=? where Z_PK=?",
-            [try! JSONSerialization.data(withJSONObject: cur), pk])
-}
-
-func orderingDrop(_ db: DB, _ pk: Int64, _ goneUUIDs: Set<String>) {
-    guard let row = db.one("select ZASSETORDERING from ZJOURNALENTRYMO where Z_PK=?", [pk]),
-          let b = row.b("ZASSETORDERING"),
-          let cur = (try? JSONSerialization.jsonObject(with: b)) as? [Any] else { return }
-    var out: [Any] = []
-    var i = 0
-    while i + 1 < cur.count {
-        if let u = cur[i] as? String, !goneUUIDs.contains(u) {
-            out.append(cur[i]); out.append(cur[i + 1])
-        }
-        i += 2
-    }
-    db.exec("update ZJOURNALENTRYMO set ZASSETORDERING=? where Z_PK=?",
-            [try! JSONSerialization.data(withJSONObject: out), pk])
-}
-
-let MEDIA_TYPES: Set<String> = ["photo", "video", "livePhoto"]
-
-func removeAssets(_ db: DB, entryPK: Int64, entryUUID: String?, assetPKs: [Int64]) -> Int {
-    var gone: Set<String> = []
-    for apk in assetPKs {
-        guard let r = db.one("""
-            select Z_PK, ZID, ZASSETTYPE from ZJOURNALENTRYASSETMO
-            where Z_PK=? and ZENTRY=?
-            """, [apk, entryPK]) else {
-            die("entry \(entryPK) has no asset \(apk) (see `show \(entryPK) --json` for ids)")
-        }
-        let t = r.s("ZASSETTYPE") ?? "?"
-        guard MEDIA_TYPES.contains(t) else {
-            die("asset \(apk) is type '\(t)', not media; refusing to remove it")
-        }
-        let au = uString(r.b("ZID"))
-        db.exec("delete from ZJOURNALENTRYASSETFILEATTACHMENTMO where ZASSET=?", [apk])
-        db.exec("delete from ZJOURNALENTRYASSETMO where Z_PK=?", [apk])
-        if let au = au {
-            gone.insert(au)
-            if let eu = entryUUID {
-                try? FileManager.default.removeItem(atPath: attachDir() + "/" + eu + "/" + au)
-            }
-        }
-    }
-    if !gone.isEmpty { orderingDrop(db, entryPK, gone) }
-    return gone.count
 }

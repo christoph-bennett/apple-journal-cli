@@ -1,57 +1,33 @@
-// journal-cli — read and write Apple Journal entries straight from its Core Data store.
+// journal-cli — read and export Apple Journal entries straight from its Core Data store.
+//
+// Read-only fork of omarshahine/apple-journal-cli: every command works on a
+// temp snapshot of the store, and the SQLite layer has no write path at all.
 //
 // Store: ~/Library/Group Containers/group.com.apple.moments/Library/moments.sqlite
 // ("moments" is Journal's internal codename.) Requires Full Disk Access.
 import Foundation
 
+let VERSION = "2.0.0"
+
 let HELP = """
 USAGE: journal-cli [--db PATH] <command> [options]
 
-Read and write Apple Journal entries from the local Core Data store.
+Read and export Apple Journal entries from the local Core Data store.
+Read-only: this build has no command, flag or code path that writes to Journal.
 
-READ
   list      [--limit N] [--since D] [--until D] [--include-empty] [--full] [--json]
   show      <id> [--json]
   search    <query> [--limit N] [--full] [--json]
-  export    --dir DIR [--format md|json]
+  export    --dir DIR [--format json|md] [--attachments copy|none]
+            [--since D] [--until D] [--include-empty]
+            json (default): DIR/journal.json with entries, text, journals,
+            places and every asset's metadata; attachments are copied to
+            DIR/attachments/ unless --attachments none
   stats
   journals  [--json]
   deleted   [--json]
   doctor
-
-WRITE (guarded: --live required against the real store; auto-backup first)
-  write     [--title T] [--body B] [--body-file F] [--body-rtf F] [--date D] [--bookmark]
-            [--markdown]
-            [--media PATH...] [--live-photo IMAGE VIDEO] [--no-resize]
-            [--photos-link] [--link URL] [--link-title T]
-            [--lat N --lon N] [--place P] [--city C] [--location-presentation small|large]
-            [--journal NAME]... [--live]
-  edit      <id> [--title T] [--body B] [--body-file F] [--body-rtf F] [--date D]
-            [--bookmark | --no-bookmark] [--add-media PATH...] [--no-resize]
-            [--photos-link] [--add-link URL] [--link-title T]
-            [--lat N --lon N] [--place P] [--city C] [--location-presentation small|large]
-            [--clear-location]
-            [--remove-media ID...] [--remove-all-media]
-            [--journal NAME]... | [--add-journal NAME]... [--remove-journal NAME]...
-            [--force] [--live]
-  delete    <id> [--hard] [--force] [--live]
-  restore   <id> [--live]
-  empty     [--force] [--live]
-  repair-locations [--to small|large] [--live]
-            restore map assets that journal-cli 1.2.0 wrote with
-            --location-presentation off (Journal reads those as no location)
-  sync-journals [--journal NAME]
-            audit Mac-local memberships and print the native sync repair steps
-  sandbox   --dir DIR [--from DB]      copy the store somewhere safe for testing
-  render    [--body B | --body-file F | stdin] [--plain | --inline]
-            render Markdown to RTF (or plain text) on stdout; writes nothing
-
-  --markdown renders the body (and de-escapes the title) as Markdown into
-  Journal's rich text: headings and **bold** become real formatting rather
-  than literal syntax. --body-rtf F stores a prepared RTF file verbatim.
-
-  Every mutating command also takes --dry-run (print the plan, write nothing)
-  and --accept-risk (one-time risk acknowledgment; see the README warning).
+  version
 """
 
 var argv = Array(CommandLine.arguments.dropFirst())
@@ -69,22 +45,16 @@ guard let cmd = argv.first, cmd != "--help", cmd != "-h", cmd != "help" else {
 }
 let rest = Array(argv.dropFirst())
 
-let boolFlags: Set<String> = ["--json", "--full", "--include-empty", "--bookmark",
-                              "--dry-run", "--accept-risk", "--markdown", "--plain", "--inline",
-                              "--no-bookmark", "--live", "--hard", "--force",
-                              "--clear-location", "--remove-all-media",
-                              "--photos-link", "--no-resize"]
-let valueFlags: Set<String> = ["--limit", "--since", "--until", "--dir", "--format",
-                               "--title", "--body", "--body-file", "--body-rtf", "--date",
-                               "--lat", "--lon", "--place", "--city", "--location-presentation",
-                               // Journal membership is many-to-many, so these repeat. They
-                               // stay value flags (one name per flag) rather than list flags,
-                               // which would swallow a following positional entry id.
-                               "--journal", "--add-journal", "--remove-journal",
-                               "--link", "--link-title", "--add-link", "--from", "--to"]
-let listFlags: Set<String> = ["--media", "--add-media", "--live-photo", "--remove-media"]
+let REMOVED: Set<String> = ["write", "edit", "delete", "restore", "empty", "repair-locations",
+                            "sync-journals", "sandbox", "render"]
+if REMOVED.contains(cmd) {
+    die("'\(cmd)' was removed: this is a read-only build of journal-cli.")
+}
 
-let a = Args(rest, listFlags: listFlags, valueFlags: valueFlags, boolFlags: boolFlags)
+let boolFlags: Set<String> = ["--json", "--full", "--include-empty"]
+let valueFlags: Set<String> = ["--limit", "--since", "--until", "--dir", "--format", "--attachments"]
+
+let a = Args(rest, valueFlags: valueFlags, boolFlags: boolFlags)
 
 switch cmd {
 case "list":     cmdList(a)
@@ -95,15 +65,7 @@ case "stats":    cmdStats(a)
 case "journals": cmdJournals(a)
 case "deleted":  cmdDeleted(a)
 case "doctor":   cmdDoctor(a)
-case "write":    cmdWrite(a)
-case "edit":     cmdEdit(a)
-case "delete":   cmdDelete(a)
-case "restore":  cmdRestore(a)
-case "empty":    cmdEmpty(a)
-case "repair-locations": cmdRepairLocations(a)
-case "sync-journals": cmdSyncJournals(a)
-case "sandbox":  cmdSandbox(a)
-case "render":   cmdRender(a)
+case "version", "--version": print("journal-cli \(VERSION) (read-only)")
 default:
     die("unknown command '\(cmd)'\n\n\(HELP)")
 }

@@ -1,246 +1,153 @@
-# apple-journal-cli
+# apple-journal-cli (read-only fork)
 
-**Read and write Apple Journal entries from the terminal.** Text, photos,
-videos, Live Photos, web links, location pins, bookmarks, multiple journals —
-plus search, Markdown/JSON export, and audio transcripts. Native Swift, zero
-dependencies, macOS 14+.
+> **Fork of [omarshahine/apple-journal-cli](https://github.com/omarshahine/apple-journal-cli)
+> by Omar Shahine.** This fork removes every command that writes to Apple
+> Journal and turns the tool into a read and export utility. If you want to
+> create or edit entries from the terminal, use the original.
 
-Apple Journal has no public API, no AppleScript dictionary, and no export
-format worth scripting against. journal-cli talks directly to the app's own
-data store, safely: reads never touch the live database, writes are guarded,
-backed up, and verified against Journal's sync engine.
+**Read and export Apple Journal entries from the terminal.** Text, titles,
+journals, places, photos, videos, Live Photos, audio transcripts, workouts,
+music, contacts and the rest of Journal's asset types, exported to one JSON
+file plus a folder with every attachment. Native Swift, no dependencies,
+macOS 14+.
+
+Apple Journal has no public API and no export format worth scripting against.
+journal-cli reads the app's own data store from a temporary copy, so the
+live store is never opened by SQLite at all.
 
 ```
-$ journal-cli list --limit 3
-   117  2026-08-21 00:43:01  Test new features
-   116  2026-08-21 00:32:11  link test
-   115  2026-08-20 22:16:40  test journal routing
-
-$ journal-cli show 117
-audio (asset 705)  2.2s  "This is a test of an audio recording."
-location  Golden Gate Bridge, San Francisco  (37.8199, -122.4783)
+$ journal-cli export --dir ~/journal-export
+Wrote 1340 entries to /Users/you/journal-export/journal.json
+attachments: 1820 copied, 0 already present, 0 missing in store
 ```
 
-> [!WARNING]
-> **Back up your journal first.** journal-cli writes directly to Apple
-> Journal's private, undocumented data store. Apple does not support this; a
-> macOS update can change the schema at any time, and a bad write could
-> corrupt entries or confuse iCloud sync across **all** your devices. Before
-> your first live write, export a backup in Journal.app (**Journal → Settings
-> → Export Journal Entries…**). journal-cli also snapshots the local store to
-> `~/Backups/journal-cli/` before every live write, but that cannot undo
-> anything that has already synced to iCloud. **Use at your own risk.** The
-> CLI requires a one-time risk acknowledgment before its first live write
-> (interactive prompt, or `--accept-risk`).
+## What changed from the original
+
+- Removed: `write`, `edit`, `delete`, `restore`, `empty`, `repair-locations`,
+  `sync-journals`, `sandbox`, `render`, the Day One importer, the Python
+  reference implementation, and the npm/Homebrew release pipeline. Calling a
+  removed command exits 1 with `'<cmd>' was removed`.
+- The SQLite layer has no `exec()`. Connections open `SQLITE_OPEN_READONLY`
+  with `PRAGMA query_only=1`, and they only ever open a temp snapshot.
+- `export` defaults to JSON and copies attachments next to it. It now covers
+  every asset type, journal membership, a flat `places` list per entry,
+  decoded workout routes, and ISO 8601 timestamps with UTC offset.
+- `export` refuses any `--dir` inside Journal's container.
+- Fixed: Markdown export printed coordinates as `Optional(47.6)`.
 
 ## Install
 
 ```sh
-brew install omarshahine/tap/journal-cli
-# or
-npm install -g apple-journal-cli
-# or from source
-git clone https://github.com/omarshahine/apple-journal-cli && cd apple-journal-cli/swift
+git clone https://github.com/christoph-bennett/apple-journal-cli && cd apple-journal-cli/swift
 swift build -c release && cp .build/release/journal-cli /usr/local/bin/
 ```
 
-Grant **Full Disk Access** to your terminal (System Settings → Privacy &
+Grant **Full Disk Access** to your terminal (System Settings > Privacy &
 Security), then:
 
 ```sh
 journal-cli doctor
 ```
 
-Release history and upgrade notes: [CHANGELOG.md](CHANGELOG.md).
+The binary keeps the name `journal-cli`. If you also have the original
+installed, put this build somewhere else on your `PATH` or rename it.
 
-## Reading
-
-Reads run against a temp snapshot of the store, so they are safe while
-Journal.app is open and never lock the live database.
+## Commands
 
 ```sh
 journal-cli list --limit 20 --full            # --full prints bodies
-journal-cli list --since 2025-01-01 --until 2025-12-31
-journal-cli show 95                           # entry + assets + attachment paths
+journal-cli list --since 2025-01-01 --until 2025-12-31 --json
+journal-cli show 95 --json                    # entry + assets + attachment paths
 journal-cli search tokyo
-journal-cli write --body "Ran a 5K" --journal Fitness --add-journal Mindset --live
-journal-cli edit 42 --add-journal Leisure --live      # keeps existing memberships
-journal-cli edit 42 --remove-journal Leisure --live
-journal-cli export --dir ~/journal-export     # one .md per entry, YAML frontmatter
-journal-cli export --dir ~/export --format json
 journal-cli stats                             # counts, words, by-year histogram
-journal-cli journals                          # list journals
-journal-cli deleted                           # list Recently Deleted
+journal-cli journals                          # journals with entry counts
+journal-cli deleted                           # Recently Deleted
+journal-cli export --dir ~/journal-export     # JSON + attachments
+journal-cli export --dir ~/md --format md     # one .md per entry, YAML frontmatter
+journal-cli version
 ```
 
-`show` decodes everything Journal stores: entry text, titles, bookmark state,
-photo/video attachment paths, location pins with place names, web links with
-titles, **audio transcripts** (word-level, joined), and handwriting-recognition
-text from drawings.
+Every command reads from a temp snapshot of `moments.sqlite` plus its `-wal`
+and `-shm` files, so it is safe to run while Journal.app is open. `--db PATH`
+(or `$JOURNAL_DB`) points at another store, such as a backup copy.
 
-## Writing
-
-Writes against the real store require `--live`, refuse to run while
-Journal.app is open, take a timestamped backup to `~/Backups/journal-cli/`
-first, and require a **one-time risk acknowledgment** (interactive prompt, or
-`--accept-risk` for scripts — agents should ask their user before passing it).
-Every mutating command also takes `--dry-run`, which prints the plan and
-writes nothing. New entries sync to iCloud like native ones — verified end to end,
-including CloudKit accepting attached files.
+## Export
 
 ```sh
-# text, dated, bookmarked
-journal-cli write --live --title "Monday" --body "Long run, then coffee." \
-    --date 2026-08-01 --bookmark
-
-# photos and video (images auto-downscale to Journal's own ~6MP cap)
-journal-cli write --live --body "Beach day" --media a.heic b.mov
-
-# a Live Photo is an image + video pair
-journal-cli write --live --body "Golden hour" --live-photo IMG_0123.heic IMG_0123.mov
-
-# location pin
-journal-cli write --live --body "At the office" \
-    --lat 47.62055 --lon -122.34930 --place "Space Needle" --city Seattle \
-    --location-presentation large # small (default) or large
-
-# web link (renders as a rich link card)
-journal-cli write --live --body "Read this" --link https://example.com --link-title "A Post"
-
-# markdown -> Journal's own rich text (bold, italic, lists, strikethrough)
-journal-cli write --live --markdown --body-file entry.md
-
-# stage in a Mac-local journal; link photos back to the Photos library
-journal-cli write --live --journal "Travel" --body "..." --media IMG_0079.JPG --photos-link
-
-# audit staged memberships and print the native Journal.app finalization steps
-journal-cli sync-journals --journal "Travel"
+journal-cli export --dir DIR [--format json|md] [--attachments copy|none]
+                   [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--include-empty]
 ```
 
-### Editing
+With the defaults you get:
 
-```sh
-journal-cli edit 103 --live --body "Rewritten." --title "New title"
-journal-cli edit 103 --live --lat 47.6 --lon -122.3 --place Home   # set/replace pin
-journal-cli edit 103 --live --add-media c.heic --add-link https://example.org
-journal-cli edit 103 --live --remove-media 700                     # ids shown by `show`
-journal-cli edit 103 --live --clear-location --no-bookmark
-journal-cli edit 103 --live --journal "Travel"                     # stage an imported entry
+```
+DIR/
+├── journal.json
+└── attachments/<entryUUID>/<assetUUID>/<file>
 ```
 
-### Repairing
+Attachments are copied, never moved, keeping Journal's own folder layout.
+On APFS the copy is a clone, so 2 GB of photos takes a couple of seconds and
+no extra disk space until something changes. Re-running an export skips files
+already present with the same size.
 
-```sh
-journal-cli repair-locations --dry-run  # find maps written by 1.2.0's `off`
-journal-cli repair-locations --live     # restore them as small map cards
+`journal.json` looks like this (trimmed):
+
+```json
+{
+  "export": { "format": "journal-cli-export", "version": 1, "tool": "journal-cli 2.0.0",
+              "exported_at": "2026-10-15T08:02:22Z", "attachments": "copy", "entry_count": 1340 },
+  "journals": [ { "id": 1, "name": "Journal", "default": true } ],
+  "entries": [
+    {
+      "id": 1056, "uuid": "…", "date": "2026-01-02 07:34:09",
+      "date_iso": "2026-01-02T07:34:09+01:00", "created": "…", "updated": "…",
+      "title": "", "text": "plain text of the entry", "chars": 412,
+      "bookmarked": false, "draft": false, "synced": true,
+      "entry_type": "blankEntry", "date_source": "custom",
+      "journals": [ { "id": 1, "name": "Journal" } ],
+      "places": [ { "name": "…", "city": "…", "lat": 44.67, "lon": 8.46,
+                    "type": "…", "asset_type": "multiPinMap" } ],
+      "assets": [
+        { "id": 700, "uuid": "…", "type": "photo", "source": "…", "created": "…",
+          "hidden": false, "metadata": { "date": 0, "placeName": "…", "latitude": 44.67 },
+          "place": { "name": "…", "lat": 44.67, "lon": 8.46 },
+          "files": [ { "name": "image", "path": "/Users/…/Attachments/…/IMG.jpeg",
+                       "relative_path": "…/IMG.jpeg", "export_path": "attachments/…/IMG.jpeg",
+                       "bytes": 812345, "exists": true } ] }
+      ]
+    }
+  ]
+}
 ```
 
-Only needed if you used `--location-presentation off` on journal-cli 1.2.0.
-See "Why there is no location `off`" below.
+Notes on the fields:
 
-### Deleting
-
-```sh
-journal-cli delete 103 --live          # soft delete -> Recently Deleted; syncs
-journal-cli restore 103 --live         # bring it back; syncs
-journal-cli empty --live               # purge never-synced deleted entries
-journal-cli delete 103 --live --hard   # full row+file removal (guarded, see below)
-```
-
-## Coming from Day One?
-
-`skills/dayone-import/` migrates Day One journals into Apple Journal, entry
-by entry, with photos, locations, titles and bookmarks intact.
-
-```sh
-S=skills/dayone-import/scripts/dayone-import.py
-
-python3 $S journals                    # list Day One journals
-python3 $S plan "Travel Journal"       # what imports, and what can't
-python3 $S import "Travel Journal" --into "Travel" --location-presentation large --target-db "$(journal-cli sandbox --dir /tmp/r)"
-python3 $S import "Travel Journal" --into "Travel"
-```
-
-It reads Day One's own SQLite store rather than its markdown export, because
-the export **renders every timestamp in the exporting machine's timezone**.
-Entries written abroad come out hours off and some land on the wrong day. The
-original zone is in the store, so the import can preserve the wall clock you
-actually experienced. `fix-export` repairs an export you already have.
-
-Two more things it knows:
-
-- **Day One's location is where the *app* was**, not where the photos were
-  taken — entries written up later carry your home address. `fix-locations`
-  corrects them from photo EXIF, corroborated against the Photos library so a
-  camera with a stale GPS fix can't drag a whole trip to one spot.
-- **Day One keeps media cloud-only** until asked. A journal can look complete
-  in the app while almost nothing is on disk. `plan` reports the shortfall
-  before you import anything.
-- **Day One writes Markdown, Journal renders rich text.** Entries are
-  converted with `--markdown`, so headings become bold, `- ` and `1. ` become
-  real lists, and Day One's `\.` escaping disappears instead of showing up
-  literally. `fix-text` re-renders entries imported before this existed.
-
-Imports are resumable, keyed by Day One's entry UUIDs, so re-running never
-double-writes.
-
-## Agent-friendly by design
-
-journal-cli is built to be driven by AI agents and scripts as much as by
-humans:
-
-- **`--json` on every read command** — stable keys, machine-parseable, no
-  ANSI. `list`, `show`, `search`, `journals`, `deleted` all speak JSON.
-- **Meaningful exit codes** — `0` success, `1` refusal or error, with a
-  one-line reason on stderr prefixed `journal-cli:`.
-- **`--help` / `doctor`** — full usage from the binary itself;
-  `doctor` reports access state and entry count, exit 1 when setup is needed.
-- **Guardrails an agent cannot stumble past** — destructive or risky paths
-  (`--live`, `--force`, `--hard`) must be opted into explicitly, and every
-  live write auto-backs-up first.
-- **Sandboxing as a first-class command** — `sandbox --dir D [--from BACKUP]`
-  hands back a disposable copy of the store; every other command accepts
-  `--db` (or `$JOURNAL_DB`) to target it. Agents can rehearse a write with
-  zero risk, then replay it `--live`.
-- **Skills ship in-repo** — `skills/journal-cli/SKILL.md` teaches
-  Claude-style agents the command surface, the safety model, and the sharp
-  edges; `skills/dayone-import/SKILL.md` covers migrating from Day One.
+- `text` and `title` are plain text converted from Journal's RTF. Bold,
+  lists and other formatting are not carried over.
+- `places` merges map pins (`multiPinMap`, `genericMap`) with the location
+  stored on photos and videos. `asset_type` says where each one came from.
+- `metadata` is the asset's decoded metadata with opaque archived blobs
+  removed (MapKit items, map styling, camera state, link archives, route
+  archives). Their useful content appears as named fields instead:
+  - `workoutRoute` assets get `route`: a list of `{lat, lon, alt, speed, time}` points.
+  - `link` assets get `url` and `link_title` when the archive has them.
+  - `audio` assets get `duration` and `transcript`.
+  - `drawing` assets get `drawing_text`, the handwriting recognition text.
+- `files[].path` is the original location in Journal's container, and
+  `export_path` is relative to the export directory. It is missing when
+  `--attachments none` is used.
+- Entries in Recently Deleted are not exported. `deleted --json` lists them.
 
 ## Safety model
 
 | Layer | Behavior |
 |---|---|
-| Reads | temp snapshot of `db`+`-wal`+`-shm`; live store never opened for read |
-| Risk acknowledgment | first live write requires typing "I understand" (or `--accept-risk`); stored in `~/.config/journal-cli/` |
-| `--dry-run` | every mutating command can print its plan and write nothing |
-| `--live` gate | writes to the real store refuse to run without it |
-| App check | writes refuse to run while Journal.app is open |
-| Auto-backup | every live write snapshots the store to `~/Backups/journal-cli/` first |
-| Synced hard-deletes | refused without `--force`: a local row delete does not tombstone the CloudKit record, and the entry **resurrects on the next sync** (observed). Soft delete syncs properly. |
-| CRDT text guard | text edits on app-authored entries are refused without `--force` (see below) |
-| Sandbox | `sandbox` + `--db` target a throwaway copy; the `--live` gate does not apply there |
-
-## Verified behavior
-
-Every write path has been verified against a real library on macOS 26:
-Journal.app renders CLI-written text, photos, Live Photos (labeled as such),
-link cards, and location pins (which also feed its Places index); the sync
-engine uploads them all to CloudKit — including the attachment files — and a
-delete/restore round trip propagates. Map cards were checked against the app's
-three modes: `small` and `large` are reproducible from the asset row, `off` is
-not (see "Why there is no location `off`"). The read pipeline has been swept over an
-entire real store: every entry row and all ~700 asset metadata blobs parse.
-
-The test suite (`tests/test_write.sh`) runs the whole command
-surface against a disposable copy of a store — argument guards, insert
-bookkeeping, RTF round-trips, location metadata, media file layout, Live Photo
-pairing, Photos linkage, journal targeting, link assets, the delete/restore
-lifecycle, and `PRAGMA integrity_check`. Point `JOURNAL_SEED` at a backup to
-run it without Full Disk Access, or point it at `tests/make-fixture.sh`'s
-synthetic store to run with no Journal library at all (what CI does); the suite
-is seed-independent and passes either way. `JOURNAL_CLI` selects the binary under test;
-the Python implementation in `reference/` remains an executable reference for
-the original command surface.
+| Snapshot | every command copies `db`+`-wal`+`-shm` to a temp dir and queries the copy; the copy is deleted afterwards |
+| SQLite | `SQLITE_OPEN_READONLY` + `PRAGMA query_only=1`; the wrapper has no `exec()` |
+| Commands | all write commands are gone from the binary; their names exit 1 |
+| Export target | refused anywhere inside `~/Library/Group Containers/group.com.apple.moments` or next to `--db` |
+| Tests | the suite fingerprints every file of the fixture store before and after and fails on any change, and greps the sources for write SQL |
 
 ## How it works
 
@@ -250,92 +157,35 @@ Journal's store is a Core Data SQLite database:
 ~/Library/Group Containers/group.com.apple.moments/Library/moments.sqlite
 ```
 
-"moments" is Journal's internal codename, which is why searching for "journal"
-never finds it. Entry text is plain RTF in `ZJOURNALENTRYMO.ZTEXT` — not
-encrypted. (The encrypted CloudKit records under the app container are only
-the sync cache.)
+"moments" is Journal's internal codename, which is why searching for
+"journal" never finds it. Entry text is plain RTF in `ZJOURNALENTRYMO.ZTEXT`
+and is not encrypted. The encrypted CloudKit records under the app container
+are only the sync cache.
 
 | Data | Storage |
 |---|---|
 | entries | `ZJOURNALENTRYMO`; text/title as RTF blobs; Core Data epoch timestamps |
-| assets | `ZJOURNALENTRYASSETMO` — 12 types (photo, video, livePhoto, multiPinMap, link, audio, drawing, stateOfMind, streakEvent, workoutRoute/Icon, motionActivity) |
+| assets | `ZJOURNALENTRYASSETMO`: photo, video, livePhoto, multiPinMap, genericMap, link, audio, drawing, contact, music, stateOfMind, workoutRoute, workoutIcon, motionActivity, streakEvent |
 | files | `ZJOURNALENTRYASSETFILEATTACHMENTMO` → `Attachments/<entryUUID>/<assetUUID>/…` |
 | asset metadata | one version byte `0x01` + JSON; `0x02` + UUID = Core Data external storage in `.moments_SUPPORT/_EXTERNAL_DATA/` |
 | links | base64 `NSKeyedArchiver`-archived `LPLinkMetadata` inside the asset metadata |
-| audio | asset metadata carries duration, waveform, and a word-level transcript |
-| journals | `ZJOURNALMO` (names live in each journal's merge blob) + `Z_5JOURNALS` join; direct join changes are Mac-local until Journal.app performs a native move and authors the per-entry merge data |
-| new-row bookkeeping | fresh `Z_PK`, bumped `Z_PRIMARYKEY.Z_MAX`, 16-byte UUID `ZID`, `ZISUPLOADEDTOCLOUD=0` — Journal's sync engine adopts the row and uploads it |
+| workout routes | base64 `NSKeyedArchiver` array of `CLLocation` |
+| journals | `ZJOURNALMO` (names live in each journal's CRDT merge blob) + `Z_5JOURNALS` join; entries with no join row belong to the default journal |
 
-### The CRDT limitation
-
-A CRDT (Conflict-free Replicated Data Type) is a data structure built so that
-several devices can edit the same content offline and still merge to an
-identical result, with no server picking winners. Instead of storing "the
-string", a text CRDT stores every character with an identity and causal
-history, so two devices replaying each other's operations always converge.
-
-Journal keeps such a CRDT in `ZMERGEABLEATTRIBUTES` (magic `crdt`, a protobuf)
-— a second, richer copy of the entry text alongside the RTF, present on every
-entry whose text was typed in the app. Consequences:
-
-- **`edit` refuses to rewrite text on CRDT-bearing entries** unless `--force`
-  is passed: rewriting only the RTF leaves the CRDT holding the old text with
-  authoritative history, and sync can revert or duplicate the edit. Location,
-  media, links, date, and bookmark remain editable. Journal moves on entries
-  with merge data must be performed in Journal.app so they sync correctly.
-- **CLI-written entries have no CRDT.** Journal renders and syncs them fine,
-  but a simultaneous edit on two devices may not merge like an app-authored
-  entry would.
-- **Authoring the CRDT is out of scope** — fabricating causal history in a
-  reverse-engineered protobuf risks corrupting merge for that entry.
-- **Some entry state lives only in the CRDT**, and so is not ours to write.
-  Location `off` is the known case — see below.
-
-### Why there is no location `off`
-
-Journal's map card has three modes (Off / Small / Large), but only two of them
-are in the asset row. The size is `ZISSLIM`; **Off is recorded solely in the
-entry's CRDT**, whose key table reads `title`, `gridAssetIDs`, `slimAssetID`,
-`hiddenAssetIDs`, `assetPlacement`. An Off map is listed under
-`hiddenAssetIDs` there, and its asset row stays byte-identical to a large
-one — `ZISSLIM=0, ZISHIDDEN=0`.
-
-Measured against a live store of 5,000+ assets: `ZISHIDDEN` is `0` on every
-asset of every type, Journal never sets it, and on all 39 entries whose CRDT
-carries `hiddenAssetIDs` the asset rows still read `ZISHIDDEN=0`. Five of
-those entries have a map as their only asset and carry `hiddenAssetIDs` with
-no `gridAssetIDs`/`slimAssetID`, which pins the meaning down exactly.
-
-So `ZISHIDDEN=1` does not hide a map card. Journal treats the asset as absent
-altogether: no card **and no Places entry**, the location effectively gone.
-journal-cli 1.2.0 shipped `--location-presentation off` written that way;
-1.3.0 refuses the flag rather than silently losing locations.
-
-If you imported with 1.2.0, the coordinates are still in the rows and
-`repair-locations` fixes them in place — no re-import:
-
-```sh
-journal-cli repair-locations --dry-run            # count what is affected
-journal-cli repair-locations --live               # restore as small maps
-journal-cli repair-locations --to large --live    # or as large ones
-```
-
-### Not supported
-
-- Creating system-generated assets: streaks, state of mind, workout data,
-  motion activity, drawings. Their metadata all decodes on read.
-- Writing audio entries (transcripts and duration are read).
-- Rendering `PKDrawing` stroke data.
-- Whether a purged CloudKit record is tombstoned on *other* devices has not
-  been verified from this machine.
+Journal also keeps a CRDT copy of app-typed entry text in
+`ZMERGEABLEATTRIBUTES`. This fork reads the RTF copy, which matches what the
+app shows.
 
 ## Development
 
 ```sh
-cd swift && swift build            # debug build
-tests/test_write.sh                # full suite against a store copy
+cd swift && swift build -c release
+DB=$(tests/make-fixture.sh /tmp/jfixture)   # synthetic store, no personal data
+JOURNAL_SEED="$DB" tests/test_read.sh
 ```
 
-The `reference/` directory holds the original Python implementation — same
-command surface, same test suite, useful for spelunking since it needs no
-build step.
+CI runs the suite under UTC and America/Los_Angeles.
+
+## License
+
+MIT, same as the original. See [LICENSE](LICENSE).

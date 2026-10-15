@@ -3,6 +3,3 @@ __pycache__/
 .sandbox/
 WORKLOG.md
 swift/.build/
-npm/bin/journal-cli
-npm/README.md
-npm/*.tgz

@@ -13,8 +13,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("LinkPresentation"),
-                .linkedFramework("ImageIO"),
-                .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("CoreLocation"),
             ]
         ),
     ]
